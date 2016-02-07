@@ -6,7 +6,7 @@
 static int __init myprintk_init(void)
 {
     /* 
-     * System.map or /proc/kallsyms provide addresses
+     * System.map or /proc/kallsyms provides addresses
      * Need to be root to see addresses
      * normal users see zeros.
      * # cat /proc/kallsyms | grep "T printk"

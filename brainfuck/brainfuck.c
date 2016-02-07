@@ -12,6 +12,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 
 /* < > + - , . [ ] */
 /* > : increment data pointer */
@@ -72,7 +73,12 @@ int main(int argc, char *argv[])
     }
 
     /* parse bfcode */
-    parse_bfcode(filep);
+    rc = parse_bfcode(filep);
+    if (rc != 0)
+    {
+        fprintf(stderr, "Error: bfcode parser.");
+        exit(rc);
+    }
 
     /* close file */
     fclose(filep);
