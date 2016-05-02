@@ -1,6 +1,6 @@
 
 /*
- * jumptable.c
+ * jumptable_funcptr.c
  * Victor Hugo Erminpour
  */
 
