@@ -1,6 +1,7 @@
 
 /* ip_validate.c */
 /* Victor Ermminpour */
+
 #include <stdio.h>
 #include <arpa/inet.h> /* inet_pton() */
 #include <netinet/in.h> /* struct in_addr */
@@ -8,30 +9,27 @@
 #define FALSE 0
 #define TRUE !FALSE
 
-int is_ipv4(const char *str)
+__is_valid_ip(int addr_family, const char *str)
 {
     int ret = -1;
     struct in_addr dest;
 
-    ret = inet_pton(AF_INET, str, &dest);
-    if (ret > 0) { 
+    ret = inet_pton(addr_family, str, &dest);
+    if (ret > 0) 
         return TRUE;
-    }    
-    return FALSE;
+    else    
+        return FALSE;
+}
+
+int is_ipv4(const char *str)
+{
+    return __is_valid_ip(AF_INET, str);
 }
 
 int is_ipv6(const char *str)
 {
-    int ret = -1;
-    struct in_addr dest;
-
-    ret = inet_pton(AF_INET6, str, &dest);
-    if (ret > 0) { 
-        return TRUE;
-    }    
-    return FALSE;
+    return __is_valid_ip(AF_INET6, str);
 }
-
 
 int main(int argc, char *argv[])
 {
