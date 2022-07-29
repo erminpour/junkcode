@@ -1,0 +1,597 @@
+#!/usr/bin/env python3
+'''
+##
+## fencrypt (Final Project)
+## Applied Cryptography (Spring 2022)
+## Victor Erminpour (vhe2005@nyu.edu)
+'''
+
+import sys
+import argparse
+import hashlib
+import hmac
+import secrets
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes, hmac as HMAC
+import binascii
+import os
+import json
+import unicodedata
+import glob
+import getpass
+
+## Globals
+ACTION = 'encrypt'
+JSON_O = False
+FILE_LIST = []
+PBKDF2_KEYS = {}
+
+## Valid Unicode categories
+valid_category = [ 'Lu', 'Ll', 'Lt', 'Lm', 'Lo', 'Mn', 'Nd', 'Pc' ]
+
+
+def xor_bytes(bytes1, bytes2):
+    ''' xor_bytes '''
+
+    assert(len(bytes1) == len(bytes2))
+    res = []
+    for i in range(len(bytes1)):
+        res.append(bytes1[i] ^ bytes2[i])
+    return bytes(res)
+
+
+def aes_ctr_enc(key, data):
+    ''' aes_ctr_enc '''
+
+    ## Get first 16 bytes from data
+    left_side = data[:32]
+    right_side = data[32:]
+
+    ## Convert inputs to bytes
+    key = bytes.fromhex(key)
+    left_side = bytes.fromhex(left_side)
+    right_side = bytes.fromhex(right_side)
+
+    ## AES-CTR mode
+    aes_ctx = Cipher(algorithm=algorithms.AES(key), \
+                     mode=modes.CTR(left_side), \
+                     backend=default_backend())
+
+    final_string = left_side.hex() + \
+                   aes_ctx.encryptor().update(right_side).hex()
+
+    return final_string
+
+
+def aes_ctr_dec(key, data):
+    ''' aes_ctr_dec '''
+
+    ## Get first 16 bytes from data
+    left_side = data[:32]
+    right_side = data[32:]
+
+    ## Convert inputs to bytes
+    key = bytes.fromhex(key)
+    left_side = bytes.fromhex(left_side)
+    right_side = bytes.fromhex(right_side)
+
+    ## AES-CTR mode
+    aes_ctx = Cipher(algorithm=algorithms.AES(key), \
+                     mode=modes.CTR(left_side), \
+                     backend=default_backend())
+
+    final_string = left_side.hex() + \
+                   aes_ctx.decryptor().update(right_side).hex()
+
+    return final_string
+
+
+def hmac_sha256_enc(key, data):
+    ''' hmac_sha256_enc '''
+
+    ## Get first 16 bytes from data
+    left_side = data[:32]
+    right_side = data[32:]
+
+    ## Convert inputs to bytes
+    key = bytes.fromhex(key)
+    left_side = bytes.fromhex(left_side)
+    right_side = bytes.fromhex(right_side)
+
+    ## HMAC-SHA-256
+    h = HMAC.HMAC(key, hashes.SHA256())
+    h.update(right_side)
+    signature = h.finalize()
+
+    ## Bytes to string
+    signature = signature.hex()
+
+    ## Get First 16 bytes
+    signature = signature[:32]
+
+    ## Convert to bytes and xor
+    signature = bytes.fromhex(signature)
+    final = xor_bytes(left_side, signature)
+
+    final_string = final.hex() + \
+                   right_side.hex()
+
+    return final_string
+
+
+def feistel_enc(keys, data):
+    ''' feistel_enc '''
+
+    data = aes_ctr_enc(keys[0], data)
+    data = hmac_sha256_enc(keys[1], data)
+    data = aes_ctr_enc(keys[2], data)
+    data = hmac_sha256_enc(keys[3], data)
+
+    return data
+
+
+def feistel_dec(keys, data):
+    ''' feistel_dec '''
+
+    data = hmac_sha256_enc(keys[3], data)
+    data = aes_ctr_dec(keys[2], data)
+    data = hmac_sha256_enc(keys[1], data)
+    data = aes_ctr_dec(keys[0], data)
+
+    data = binascii.unhexlify(data).hex()
+
+    return data
+
+
+def generate_master_key(password, salt):
+    ''' generate_master_key '''
+
+    ## Iterate 250,000 times
+    iters = 250000
+    dk = hashlib.pbkdf2_hmac('sha256', password.encode(), \
+                             salt, iters, dklen=32)
+    dk = dk.hex()
+
+    return dk
+
+
+def generate_key_schedule_dict(master_key):
+    ''' generate_key_schedule_dict '''
+
+    key_schedule_dict = { \
+            "validator": "", \
+            "feistel": [], \
+            "mac": "", \
+            "search_terms": "" \
+            }
+
+    data = "00000000000000000000000000000000"
+
+    ## Split the mater_key in half
+    key = master_key[:len(master_key)//2]
+    IV = master_key[len(master_key)//2:]
+
+    ## Convert to bytes
+    key = bytes.fromhex(key)
+    IV = bytes.fromhex(IV)
+    data = bytes.fromhex(data)
+
+    i = 0 
+    while i <= 6:
+
+        ## AES-CBC mode with IV
+        block = Cipher(algorithm=algorithms.AES(key), \
+                       mode=modes.CBC(IV)).encryptor().update(data)
+
+        ## Increment IV
+        iv_int = int.from_bytes(IV, byteorder='big')
+        iv_int += 1
+        IV = iv_int.to_bytes(16, 'big')
+
+        ## Update final_json with results
+        if i == 0:
+            key_schedule_dict["validator"] = block.hex()
+        elif (i >= 0 and i <= 4):
+            key_schedule_dict["feistel"].append(block.hex())
+        elif i == 5:
+            key_schedule_dict["mac"] = block.hex()
+        elif i == 6:
+            key_schedule_dict["search_terms"] = block.hex()
+
+        ## Increment index
+        i += 1
+
+    ## return dict
+    return key_schedule_dict
+
+
+def do_search(search_terms):
+    ''' do_search '''
+
+    ## Get password
+    password = get_password()
+    found_password = False
+
+    files = glob.glob('.fenc-meta.*')
+
+    ## Print each file's master_key
+    if(JSON_O):
+        for search_term in search_terms:
+            for file in files:
+                with open(file, 'r') as json_file:
+
+                    ## Read dict from meta_file
+                    meta_json = json.load(json_file)
+
+                    salt = meta_json["salt"]
+                    salt = binascii.unhexlify(meta_json["salt"])
+                    validator = meta_json["validator"]
+
+                    terms = meta_json["terms"].copy()
+
+                    ## Generate master_key
+                    master_key = generate_master_key(password, salt)
+
+                    ## Generate key_schedule_dict
+                    key_schedule = generate_key_schedule_dict(master_key)
+
+                    if key_schedule["validator"] == validator:
+
+                        ## Validator match
+                        PBKDF2_KEYS[file[11:]] = master_key
+
+        if len(PBKDF2_KEYS) > 0: 
+            PBKDF2_string = json.dumps(PBKDF2_KEYS, indent=4)
+            print(PBKDF2_string)
+
+    ## Do search
+    for search_term in search_terms:
+        for file in files:
+
+            with open(file, 'r') as json_file:
+
+                ## Read dict from meta_file
+                meta_json = json.load(json_file)
+
+                salt = meta_json["salt"]
+                salt = binascii.unhexlify(meta_json["salt"])
+
+                validator = meta_json["validator"]
+
+                ## If binary file, continue
+                terms = meta_json["terms"].copy()
+                if len(terms) == 0:
+                    continue
+
+                ## Generate master_key
+                master_key = generate_master_key(password, salt)
+
+                ## Generate key_schedule_dict
+                key_schedule = generate_key_schedule_dict(master_key)
+
+                if key_schedule["validator"] == validator:
+
+                    ## Validator match
+                    found_password = True
+  
+                    ## Do actual search
+
+                    new_string = search_term.casefold()
+                    new_string = unicodedata.normalize('NFC', new_string)
+ 
+                    ## Generate HMAC
+                    hmac_string = hmac.new(bytes.fromhex(key_schedule["search_terms"]), \
+                                           bytes.fromhex(new_string.encode().hex()), \
+                                           hashlib.sha256).hexdigest()
+                    #print("HMAC_STRING", hmac_string)
+
+                    if hmac_string in terms:
+                        ## Found
+                        print(file[11:])
+                else:
+                    print(file[11:], ": Validator does not match!", file=sys.stderr)
+
+    if not found_password:
+        exit(1)
+    exit(0)
+
+
+def handle_cmdline_args():
+    ''' handle_cmdline_args '''
+
+    global ACTION
+    global JSON_O
+    global FILE_LIST
+
+    # Create the parser
+    parser = argparse.ArgumentParser()
+
+    # Add an argument
+    parser.add_argument('-j', '--json', action='store_true', help='JSON output')
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-e', '--encrypt', action='store_true', help='Encrypt file')
+    group.add_argument('-d', '--decrypt', action='store_true', help='Decrypt file')
+    group.add_argument('-s', '--search', action='store_true', help='Search')
+
+    ## The rest of arguments are files
+    parser.add_argument('files', nargs='*')
+
+    # Parse the argument
+    args = parser.parse_args()
+
+    if(args.encrypt):
+        ACTION = 'encrypt'
+    elif(args.decrypt):
+        ACTION = 'decrypt'
+    elif(args.search):
+        ACTION = 'search'
+    if(args.json):
+        JSON_O = True
+
+    if not (args.files):
+        print("ERROR: Please provide a file to", ACTION)
+        exit(1)
+    else:
+        FILE_LIST = args.files.copy()
+
+    ## Do search and quit
+    if ACTION == "search":
+        do_search(FILE_LIST)
+
+    ## File sanity checks
+    for file in FILE_LIST:
+        file_checks(file)
+
+
+def try_text_file(filename, mac_key):
+    ''' try_text_file '''
+    ## Try to open unicode file
+    try:
+
+        with open(filename, "r") as file:
+            text_string = file.read()
+
+        tmp_string = ""
+        final_list = []
+        final_list2 = []
+
+        ## Loop through each unicode character
+        for item in text_string:
+            ## If the unicode category matches
+            if unicodedata.category(item) in valid_category:
+                ## concatenate unicode character to tmp_string
+                tmp_string += item
+            else:
+                if(len(tmp_string) > 0 ):
+                    if (len(tmp_string) >= 4 and \
+                        len(tmp_string) <= 12):
+
+                        ## Append new_string to final_list
+                        new_string = tmp_string.casefold()
+                        new_string = unicodedata.normalize('NFC', new_string)
+
+                        ## Generate HMAC
+                        hmac_string = hmac.new(bytes.fromhex(mac_key), \
+                                               bytes.fromhex(new_string.encode().hex()), \
+                                               hashlib.sha256).hexdigest()
+                        #print(hmac_string)
+
+                        if not hmac_string in final_list:
+                            final_list.append(hmac_string)
+
+                            ## Build search terms
+                            while len(tmp_string) > 4:
+                                tmp_string = tmp_string[:-1]
+                                new_string = tmp_string + "*"
+                                new_string = new_string.casefold()
+                                new_string = unicodedata.normalize('NFC', new_string)
+
+                                ## Generate HMAC
+                                hmac_string = hmac.new(bytes.fromhex(mac_key), \
+                                                       bytes.fromhex(new_string.encode().hex()), \
+                                                       hashlib.sha256).hexdigest()
+
+                                if not hmac_string in final_list:
+                                    final_list.append(hmac_string)
+
+                    ## Clear tmp_string
+                    tmp_string = ""
+
+        ## Sort
+        final_list = sorted(final_list)
+        return final_list
+
+    except UnicodeDecodeError:
+        return None
+
+
+def encrypt_file(filename, keys, mac_key):
+    ''' encrypt_file '''
+
+    # opening the original file to encrypt
+    with open(filename, 'rb') as file:
+        original = file.read()
+      
+    original = binascii.hexlify(original).decode('utf-8')
+
+    # encrypting the file
+    encrypted = feistel_enc(keys, original)
+
+    ## Generate HMAC
+    hmac_string = hmac.new(bytes.fromhex(mac_key), \
+                           bytes.fromhex(encrypted), \
+                           hashlib.sha256).hexdigest()
+
+    encrypted = binascii.unhexlify(encrypted)
+
+    # open the file in write mode and 
+    # write the encrypted data
+    with open(filename, 'wb') as encrypted_file:
+        encrypted_file.write(encrypted)
+
+    return hmac_string
+
+
+def decrypt_file(filename, keys, mac_key, mac_string):
+    ''' decrypt_file '''
+
+    ## open the original file to encrypt
+    with open(filename, 'rb') as file:
+        original = file.read()
+ 
+    original = binascii.hexlify(original).decode('utf-8')
+
+    ## Generate HMAC
+    hmac_string = hmac.new(bytes.fromhex(mac_key), \
+                           bytes.fromhex(original), \
+                           hashlib.sha256).hexdigest()
+
+
+    if hmac_string != mac_string:
+        if(JSON_O):
+            PBKDF2_string = json.dumps(PBKDF2_KEYS, indent=4)
+            print(PBKDF2_string)
+        print("ERROR:", filename, "has been tampered!", file=sys.stderr)
+        exit(0)
+
+    # decrypting the file
+    plaintext = feistel_dec(keys, original)
+
+    plaintext = binascii.unhexlify(plaintext)
+
+    # opening the file in write mode and 
+    # writing the encrypted data
+    with open(filename, 'wb') as encrypted_file:
+        encrypted_file.write(plaintext)
+
+
+def file_checks(file):
+    ''' file_checks '''
+
+    ## If input file is missing, exit
+    if not os.path.isfile(file):
+        print("ERROR:", file, "does not exist!", file=sys.stderr)
+        exit(1)
+
+    ## If file is less than 32 bytes, exit
+    if (os.path.getsize(file) < 32):
+        print("ERROR:", file, "is less than 32 bytes!", file=sys.stderr)
+        exit(1)
+
+    ## meta_file name
+    meta_file=f'.fenc-meta.{file}'
+
+    ## If ACTION is encrypt, check if meta file already exists
+    if ACTION == "encrypt":
+        if os.path.isfile(meta_file):
+            print("ERROR:", file, "has already been encrypted!", file=sys.stderr)
+            exit(1)
+
+    ## If ACTION is decrypt, check if meta file DNE
+    if ACTION == "decrypt":
+        if not os.path.isfile(meta_file):
+            print("ERROR:", file, "has not been encrypted!", file=sys.stderr)
+            exit(1)
+
+
+def get_password():
+    ''' get_password '''
+
+    if sys.stdin.isatty():
+        password = getpass.getpass()
+    else:
+        ## Read in password
+        password = sys.stdin.readline().rstrip()
+
+    ## encrypt should exit >0 when no password is given
+    if len(password) == 0:
+        exit(1)
+
+    return password
+
+
+def process_file(filename, password):
+    ''' process_file '''
+
+    ## JSON struct
+    meta_json = { \
+        "salt": "",
+        "validator": "",
+        "mac": "",
+        "terms": []
+        }
+
+    ## meta_file name
+    meta_file=f'.fenc-meta.{filename}'
+
+    if ACTION == "encrypt":
+        salt = secrets.token_bytes(16)
+        meta_json["salt"] = binascii.hexlify(salt).decode('utf-8')
+
+    if ACTION == "decrypt":
+        ## Read dict from meta_file
+        with open(meta_file, 'r') as json_file:
+            meta_json = json.load(json_file)
+            salt = binascii.unhexlify(meta_json["salt"])
+
+    ## Generate master_key
+    master_key = generate_master_key(password, salt)
+    PBKDF2_KEYS[filename] = master_key
+
+    ## Generate key_schedule_dict
+    key_schedule = generate_key_schedule_dict(master_key)
+
+    if ACTION == "encrypt":
+
+        terms_list = try_text_file(filename, key_schedule["search_terms"])
+        if terms_list is not None:
+            meta_json["terms"] = terms_list.copy()
+
+        hmac_string = encrypt_file(filename, \
+                                   key_schedule["feistel"], \
+                                   key_schedule["mac"])
+
+        meta_json["mac"] = hmac_string
+        meta_json["validator"] = key_schedule["validator"]
+
+        ## Write JSON dict to meta_file
+        json_string = json.dumps(meta_json, indent=4)
+
+        with open(meta_file, 'w') as outfile:
+            outfile.write(json_string)
+
+    elif ACTION == "decrypt":
+ 
+        ## Check password
+        if key_schedule["validator"] != meta_json["validator"]:
+            print("ERROR:", file, "Password does not match!", file=sys.stderr)
+            exit(1)
+        else:
+            decrypt_file(file, \
+                         key_schedule["feistel"], \
+                         key_schedule["mac"], \
+                         meta_json["mac"])
+            os.remove(meta_file)
+
+
+if __name__ == '__main__':
+    ''' main '''
+
+    ## Handle cmdline arguments
+    handle_cmdline_args()
+
+    ## Get password
+    password = get_password()
+
+    ## Process the files
+    for file in FILE_LIST:
+        process_file(file, password)
+
+    ## Print each file's master_key
+    if(JSON_O):
+        PBKDF2_string = json.dumps(PBKDF2_KEYS, indent=4)
+        print(PBKDF2_string)
+
+
